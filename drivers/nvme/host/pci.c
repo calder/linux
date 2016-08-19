@@ -49,7 +49,7 @@
 #define NVME_AQ_DEPTH		256
 #define SQ_SIZE(depth)		(depth * sizeof(struct nvme_command))
 #define CQ_SIZE(depth)		(depth * sizeof(struct nvme_completion))
-		
+
 /*
  * We handle AEN commands ourselves and don't even let the
  * block layer know about them.
@@ -102,6 +102,10 @@ struct nvme_dev {
 	dma_addr_t cmb_dma_addr;
 	u64 cmb_size;
 	u32 cmbsz;
+	u32 *db_mem;
+	dma_addr_t doorbell;
+	u32 *ei_mem;
+	dma_addr_t eventidx;
 	unsigned long flags;
 
 #define NVME_CTRL_RESETTING    0
@@ -139,6 +143,10 @@ struct nvme_queue {
 	u16 qid;
 	u8 cq_phase;
 	u8 cqe_seen;
+	u32 *sq_doorbell_addr;
+	u32 *sq_eventidx_addr;
+	u32 *cq_doorbell_addr;
+	u32 *cq_eventidx_addr;
 };
 
 /*
@@ -305,6 +313,31 @@ static void nvme_complete_async_event(struct nvme_dev *dev,
 	}
 }
 
+static inline int nvme_need_event(u16 event_idx, u16 new_idx, u16 old)
+{
+	/* Borrowed from vring_need_event */
+	return (u16)(new_idx - event_idx - 1) < (u16)(new_idx - old);
+}
+
+static void write_doorbell(u16 value, u32 __iomem *q_db,
+			   u32 *db_addr, volatile u32 *event_idx) {
+	u16 old_value;
+	if (!db_addr)
+		goto ring_doorbell;
+
+	old_value = *db_addr;
+	*db_addr = value;
+
+	rmb();
+	if (!nvme_need_event(*event_idx, value, old_value))
+		goto no_doorbell;
+
+ring_doorbell:
+	writel(value, q_db);
+no_doorbell:
+	return;
+}
+
 /**
  * __nvme_submit_cmd() - Copy a command into a queue and ring the doorbell
  * @nvmeq: The queue to use
@@ -322,9 +355,12 @@ static void __nvme_submit_cmd(struct nvme_queue *nvmeq,
 	else
 		memcpy(&nvmeq->sq_cmds[tail], cmd, sizeof(*cmd));
 
+	if (nvmeq->sq_doorbell_addr)
+		wmb();
 	if (++tail == nvmeq->q_depth)
 		tail = 0;
-	writel(tail, nvmeq->q_db);
+	write_doorbell(tail, nvmeq->q_db,
+		       nvmeq->sq_doorbell_addr, nvmeq->sq_eventidx_addr);
 	nvmeq->sq_tail = tail;
 }
 
@@ -738,8 +774,12 @@ static void __nvme_process_cq(struct nvme_queue *nvmeq, unsigned int *tag)
 	phase = nvmeq->cq_phase;
 
 	while (nvme_cqe_valid(nvmeq, head, phase)) {
-		struct nvme_completion cqe = nvmeq->cqes[head];
+		struct nvme_completion cqe;
 		struct request *req;
+
+		if (to_pci_dev(nvmeq->dev->dev)->vendor == PCI_VENDOR_ID_GOOGLE)
+			rmb();
+		cqe = nvmeq->cqes[head];
 
 		if (++head == nvmeq->q_depth) {
 			head = 0;
@@ -785,7 +825,8 @@ static void __nvme_process_cq(struct nvme_queue *nvmeq, unsigned int *tag)
 		return;
 
 	if (likely(nvmeq->cq_vector >= 0))
-		writel(head, nvmeq->q_db + nvmeq->dev->db_stride);
+		write_doorbell(head, nvmeq->q_db + nvmeq->dev->db_stride,
+		               nvmeq->cq_doorbell_addr, nvmeq->cq_eventidx_addr);
 	nvmeq->cq_head = head;
 	nvmeq->cq_phase = phase;
 
@@ -1074,6 +1115,10 @@ static void nvme_clear_queue(struct nvme_queue *nvmeq)
 	spin_lock_irq(&nvmeq->q_lock);
 	if (nvmeq->tags && *nvmeq->tags)
 		blk_mq_all_tag_busy_iter(*nvmeq->tags, nvme_cancel_queue_ios, nvmeq);
+	nvmeq->sq_doorbell_addr = NULL;
+	nvmeq->cq_doorbell_addr = NULL;
+	nvmeq->sq_eventidx_addr = NULL;
+	nvmeq->cq_eventidx_addr = NULL;
 	spin_unlock_irq(&nvmeq->q_lock);
 }
 
@@ -1198,6 +1243,16 @@ static void nvme_init_queue(struct nvme_queue *nvmeq, u16 qid)
 	nvmeq->cq_head = 0;
 	nvmeq->cq_phase = 1;
 	nvmeq->q_db = &dev->dbs[qid * 2 * dev->db_stride];
+        if (to_pci_dev(dev->dev)->vendor == PCI_VENDOR_ID_GOOGLE && qid) {
+                nvmeq->sq_doorbell_addr =
+                                &dev->db_mem[qid * 2 * dev->db_stride];
+                nvmeq->cq_doorbell_addr =
+                                &dev->db_mem[(qid * 2 + 1) * dev->db_stride];
+                nvmeq->sq_eventidx_addr =
+                                &dev->ei_mem[qid * 2 * dev->db_stride];
+                nvmeq->cq_eventidx_addr =
+                                &dev->ei_mem[(qid * 2 + 1) * dev->db_stride];
+        }
 	memset((void *)nvmeq->cqes, 0, CQ_SIZE(nvmeq->q_depth));
 	dev->online_queues++;
 	spin_unlock_irq(&nvmeq->q_lock);
@@ -1459,6 +1514,23 @@ static size_t db_bar_size(struct nvme_dev *dev, unsigned nr_io_queues)
 	return 4096 + ((nr_io_queues + 1) * 8 * dev->db_stride);
 }
 
+static int nvme_vendor_memory_size(struct nvme_dev *dev)
+{
+	return ((num_possible_cpus() + 1) * 8 * dev->db_stride);
+}
+
+static int nvme_doorbell_memory(struct nvme_dev *dev)
+{
+	struct nvme_command c;
+
+	memset(&c, 0, sizeof(c));
+	c.common.opcode = nvme_admin_doorbell_memory;
+	c.common.prp1 = cpu_to_le64(dev->doorbell);
+	c.common.prp2 = cpu_to_le64(dev->eventidx);
+
+	return nvme_submit_sync_cmd(dev->ctrl.admin_q, &c, NULL, 0);
+}
+
 static int nvme_setup_io_queues(struct nvme_dev *dev)
 {
 	struct nvme_queue *adminq = dev->queues[0];
@@ -1544,6 +1616,25 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 		adminq->cq_vector = -1;
 		goto free_queues;
 	}
+
+        /*
+         * If this is device is from Google, it's a virtual device and send
+         * a doorbell command to use guest memory for doorbell writes. Note
+         * this command must be called before nvme_init_queue().
+        */
+        if (pdev->vendor == PCI_VENDOR_ID_GOOGLE) {
+                int res = nvme_doorbell_memory(dev);
+                if (res) {
+                        /* Free memory and continue on. */
+                        dma_free_coherent(&pdev->dev, 8192, dev->db_mem,
+                                          dev->doorbell);
+                        dma_free_coherent(&pdev->dev, 8192, dev->ei_mem,
+                                          dev->doorbell);
+                        dev->db_mem = NULL;
+                        dev->ei_mem = NULL;
+                }
+        }
+
 	return nvme_create_io_queues(dev);
 
  free_queues:
@@ -1729,6 +1820,22 @@ static int nvme_pci_enable(struct nvme_dev *dev)
 	dev->db_stride = 1 << NVME_CAP_STRIDE(cap);
 	dev->dbs = dev->bar + 4096;
 
+	if (pdev->vendor == PCI_VENDOR_ID_GOOGLE) {
+		int mem_size = nvme_vendor_memory_size(dev);
+		dev->db_mem = dma_alloc_coherent(&pdev->dev, mem_size,
+						&dev->doorbell, GFP_KERNEL);
+		if (!dev->db_mem) {
+			result = -ENOMEM;
+			goto disable;
+		}
+		dev->ei_mem = dma_alloc_coherent(&pdev->dev, mem_size,
+						&dev->eventidx, GFP_KERNEL);
+		if (!dev->ei_mem) {
+			result = -ENOMEM;
+			goto dma_free;
+		}
+	}
+
 	/*
 	 * Temporary fix for the Apple controller found in the MacBook8,1 and
 	 * some MacBook7,1 to avoid controller resets and data loss.
@@ -1747,6 +1854,10 @@ static int nvme_pci_enable(struct nvme_dev *dev)
 	pci_save_state(pdev);
 	return 0;
 
+ dma_free:
+	dma_free_coherent(&pdev->dev, nvme_vendor_memory_size(dev),
+	                  dev->db_mem, dev->doorbell);
+	dev->db_mem = NULL;
  disable:
 	pci_disable_device(pdev);
 	return result;
@@ -1754,6 +1865,18 @@ static int nvme_pci_enable(struct nvme_dev *dev)
 
 static void nvme_dev_unmap(struct nvme_dev *dev)
 {
+	int mem_size = nvme_vendor_memory_size(dev);
+	if (!dev->db_mem) {
+		dma_free_coherent(&to_pci_dev(dev->dev)->dev, mem_size, dev->db_mem,
+				  dev->doorbell);
+		dev->db_mem = NULL;
+	}
+	if (!dev->ei_mem) {
+		dma_free_coherent(&to_pci_dev(dev->dev)->dev, mem_size, dev->ei_mem,
+				  dev->eventidx);
+		dev->ei_mem = NULL;
+	}
+
 	if (dev->bar)
 		iounmap(dev->bar);
 	pci_release_regions(to_pci_dev(dev->dev));
