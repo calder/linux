@@ -19,7 +19,7 @@ This was also a problem as far as other in-kernel users were involved, since
 the solutions used were pretty much different from one driver to another, there
 was a rather big abstraction leak.
 
-This framework aims at solve these problems. It also introduces DT
+This framework aims to solve these problems. It also introduces DT
 representation for consumer devices to go get the data they require (MAC
 Addresses, SoC/Revision ID, part numbers, and so on) from the NVMEMs. This
 framework is based on regmap, so that most of the abstraction available in
